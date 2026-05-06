@@ -160,7 +160,7 @@ def modo_de_juego():
 
             tk.Button(ventana_nombre, text="Guardar", command=guardar).pack(pady=10)
 
-        
+
         def volver():
             ser.write(b"OFF\n")
             ser.flush()
@@ -252,5 +252,5 @@ Comandos para guardar a gitgub:
 1- git status
 2- git add .
 3- git commit -m "Mensaje"
-4- git push -n origin main
+4- git push -u origin main
 """

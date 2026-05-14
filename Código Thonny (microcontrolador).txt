@@ -1,0 +1,637 @@
+# ============================================================
+# StrangerTEC - Morse Translator
+# Código MicroPython para Raspberry Pi Pico W
+#
+# Este archivo corre en la maqueta y se encarga de:
+#   - Controlar los LEDs mediante registros de corrimiento 74LS164
+#   - Emitir señales Morse por el buzzer
+#   - Leer el botón del jugador B (modo VS)
+#   - Comunicarse con la interfaz de PC vía WiFi (TCP socket)
+# ============================================================
+
+
+# ============================================================
+# IMPORTAR LIBRERÍAS
+# ============================================================
+import network
+import socket
+import time
+from machine import Pin
+
+
+# ============================================================
+# CONFIGURACIÓN WIFI
+# ============================================================
+SSID     = "Andrew's phone"   # Nombre de la red WiFi
+PASSWORD = "soypobre"         # Contraseña de la red
+PORT     = 1717               # Puerto TCP del servidor
+
+
+# ============================================================
+# CONFIGURACIÓN DE PINES
+# ============================================================
+
+# --- Registro de corrimiento 1 (74LS164) ---
+# Maneja columnas C1-C8 (letras A-H, N-U)
+AB  = Pin(13, Pin.OUT)    # Línea de dato serie (A y B del 74LS164)
+CLK = Pin(15, Pin.OUT)    # Reloj (clock) del registro 1
+
+# --- Registro de corrimiento 2 (74LS164) ---
+# Maneja columnas C9-C13 (letras I-M, V-Z)
+AB2  = Pin(14, Pin.OUT)   # Línea de dato serie registro 2
+CLK2 = Pin(16, Pin.OUT)   # Reloj del registro 2
+
+# --- Filas del panel de LEDs ---
+Led_fila_1 = Pin(22, Pin.OUT)   # Fila superior:  letras A–H e I–M
+Led_fila_2 = Pin(26, Pin.OUT)   # Fila del medio: letras N–U y V–Z
+Led_fila_3 = Pin(27, Pin.OUT)   # Fila inferior:  números (no implementada)
+
+# --- Buzzer pasivo: emite sonido en Morse ---
+buzzer = Pin(0, Pin.OUT)
+
+# --- Switch de modo (pull-down interno) ---
+#   switch = 0 (LOW)  → modo LED
+#   switch = 1 (HIGH) → modo Morse (buzzer)
+switch = Pin(2, Pin.IN, Pin.PULL_DOWN)
+
+# --- Botón del jugador B (pull-down interno) ---
+# Solo activo en modo VS y durante el turno de B
+boton = Pin(5, Pin.IN, Pin.PULL_DOWN)
+
+
+# ============================================================
+# VARIABLES GLOBALES DE ESTADO
+# ============================================================
+modo_actual  = "NORMAL"  # Modo activo: "NORMAL" o "VS"
+turno_actual = "A"       # Turno activo: "A" (teclado PC) o "B" (botón físico)
+STOP         = False     # True = interrumpir visualización en curso
+
+# Tiempos del código Morse (en segundos)
+# La raya siempre dura exactamente 3 veces lo que el punto
+TIEMPO_PUNTO = 0.4
+TIEMPO_RAYA  = TIEMPO_PUNTO * 3
+
+# Anti-rebote del botón: marca de tiempo del último press válido
+ultimo_boton = 0
+
+
+# ============================================================
+# DICCIONARIO MORSE (letra → código)
+# ============================================================
+morse = {
+    "A": ".-",    "B": "-...",  "C": "-.-.",  "D": "-..",
+    "E": ".",     "F": "..-.",  "G": "--.",   "H": "....",
+    "I": "..",    "J": ".---",  "K": "-.-",   "L": ".-..",
+    "M": "--",    "N": "-.",    "O": "---",
+    "P": ".--.",  "Q": "--.-",  "R": ".-.",
+    "S": "...",   "T": "-",
+    "U": "..-",   "V": "...-",  "W": ".--",
+    "X": "-..-",  "Y": "-.--",  "Z": "--.."
+}
+
+
+# ============================================================
+# VECTORES DE COLUMNA PARA LOS REGISTROS 74LS164
+# Cada vector activa UNA salida del chip de corrimiento.
+# El chip tiene 8 salidas; enviamos 8 bits en serie.
+# ============================================================
+
+apagado = [0, 0, 0, 0, 0, 0, 0, 0]  # Apagar todas las columnas
+
+# Columnas del Registro 1 (letras A-H y N-U)
+C1 = [1, 0, 0, 0, 0, 0, 0, 0]
+C2 = [0, 1, 0, 0, 0, 0, 0, 0]
+C3 = [0, 0, 1, 0, 0, 0, 0, 0]
+C4 = [0, 0, 0, 1, 0, 0, 0, 0]
+C5 = [0, 0, 0, 0, 0, 0, 0, 1]
+C6 = [0, 0, 0, 0, 0, 0, 1, 0]
+C7 = [0, 0, 0, 0, 0, 1, 0, 0]
+C8 = [0, 0, 0, 0, 1, 0, 0, 0]
+
+# Columnas del Registro 2 (letras I-M y V-Z)
+# MAPEO ESPECIAL según el cableado físico de la maqueta:
+#   C9  → salida 8 del 74LS164
+#   C10 → salida 1
+#   C11 → salida 6
+#   C12 → salida 2
+#   C13 → salida 3
+C9  = [0, 0, 0, 0, 0, 0, 0, 1]
+C10 = [1, 0, 0, 0, 0, 0, 0, 0]
+C11 = [0, 0, 0, 0, 0, 1, 0, 0]
+C12 = [0, 1, 0, 0, 0, 0, 0, 0]
+C13 = [0, 0, 1, 0, 0, 0, 0, 0]
+
+
+# ============================================================
+# DICCIONARIO DE LEDs
+# Formato: letra → (fila, vector_registro1, vector_registro2)
+#   fila 1 = Led_fila_1  (filas A–M)
+#   fila 2 = Led_fila_2  (filas N–Z)
+# ============================================================
+diccionario_leds = {
+    # --- Fila 1, Registro 1: letras A-H ---
+    "A": (1, C1,      apagado),
+    "B": (1, C2,      apagado),
+    "C": (1, C3,      apagado),
+    "D": (1, C4,      apagado),
+    "E": (1, C5,      apagado),
+    "F": (1, C6,      apagado),
+    "G": (1, C7,      apagado),
+    "H": (1, C8,      apagado),
+    # --- Fila 1, Registro 2: letras I-M ---
+    "I": (1, apagado, C9 ),
+    "J": (1, apagado, C10),
+    "K": (1, apagado, C11),
+    "L": (1, apagado, C12),
+    "M": (1, apagado, C13),
+    # --- Fila 2, Registro 1: letras N-U ---
+    "N": (2, C1,      apagado),
+    "O": (2, C2,      apagado),
+    "P": (2, C3,      apagado),
+    "Q": (2, C4,      apagado),
+    "R": (2, C5,      apagado),
+    "S": (2, C6,      apagado),
+    "T": (2, C7,      apagado),
+    "U": (2, C8,      apagado),
+    # --- Fila 2, Registro 2: letras V-Z ---
+    "V": (2, apagado, C9 ),
+    "W": (2, apagado, C10),
+    "X": (2, apagado, C11),
+    "Y": (2, apagado, C12),
+    "Z": (2, apagado, C13),
+}
+
+
+# ============================================================
+# AJUSTAR VELOCIDAD DEL MORSE SEGÚN LA FASE
+# ============================================================
+def set_fase(f):
+    """
+    Cambia la velocidad de transmisión del código Morse.
+    La duración del punto define todo lo demás:
+      - Raya      = 3 × punto
+      - Espacio entre símbolos = 1 × punto
+      - Espacio entre letras   = 3 × punto
+    """
+    global TIEMPO_PUNTO, TIEMPO_RAYA
+
+    if f == 1:
+        TIEMPO_PUNTO = 0.4       # Fase 1: velocidad normal
+    elif f == 2:
+        TIEMPO_PUNTO = 0.3       # Fase 2: más rápido
+    elif f == 3:
+        TIEMPO_PUNTO = 0.2       # Fase 3: máxima velocidad
+
+    TIEMPO_RAYA = TIEMPO_PUNTO * 3
+    print("Fase", f, "→ punto:", TIEMPO_PUNTO, "s  raya:", TIEMPO_RAYA, "s")
+
+
+# ============================================================
+# CONECTAR A WIFI
+# ============================================================
+def connect_wifi():
+    """
+    Activa la interfaz WiFi y se conecta a la red configurada.
+    Bloquea hasta que haya conexión exitosa.
+    Retorna la IP asignada.
+    """
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(SSID, PASSWORD)
+
+    print("Conectando WiFi...")
+    while not wlan.isconnected():
+        time.sleep(1)
+
+    ip = wlan.ifconfig()[0]
+    print("Conectado. IP:", ip)
+    return ip
+
+
+# ============================================================
+# ENVIAR BITS A LOS REGISTROS DE CORRIMIENTO
+# ============================================================
+def enviar_registros(sec1, sec2):
+    """
+    Desplaza 8 bits en serie hacia cada 74LS164.
+    sec1 → Registro 1 (columnas C1-C8)
+    sec2 → Registro 2 (columnas C9-C13)
+    Se envía el bit más significativo (índice 7) primero.
+    Cada bit se captura con un pulso de reloj.
+    """
+    for i in range(8):
+        # Extraer bit en orden MSB → LSB
+        bit1 = sec1[7 - i]
+        bit2 = sec2[7 - i]
+
+        AB.value(bit1)    # poner dato en la línea serie del registro 1
+        AB2.value(bit2)   # poner dato en la línea serie del registro 2
+
+        # Pulso de reloj: el 74LS164 captura el dato en el flanco de subida
+        CLK.value(1)
+        CLK2.value(1)
+        time.sleep(0.005)
+
+        CLK.value(0)
+        CLK2.value(0)
+        time.sleep(0.005)
+
+
+# ============================================================
+# APAGAR TODO EL PANEL
+# ============================================================
+def apagar_todo():
+    """Apaga buzzer, desactiva todas las filas y limpia los registros."""
+    buzzer.value(0)
+    Led_fila_1.value(0)
+    Led_fila_2.value(0)
+    Led_fila_3.value(0)
+    enviar_registros(apagado, apagado)
+
+
+# ============================================================
+# MOSTRAR UNA LETRA EN EL PANEL DE LEDs
+# ============================================================
+def mostrar_letra(letra):
+    """
+    Enciende el LED correspondiente a 'letra' usando
+    el diccionario_leds. Apaga todo primero para evitar fantasmas.
+    """
+    apagar_todo()
+
+    if letra not in diccionario_leds:
+        return   # letra no soportada → ignorar
+
+    fila, reg1, reg2 = diccionario_leds[letra]
+    enviar_registros(reg1, reg2)   # seleccionar columna
+
+    if fila == 1:
+        Led_fila_1.value(1)        # activar fila 1
+    elif fila == 2:
+        Led_fila_2.value(1)        # activar fila 2
+
+
+# ============================================================
+# PAUSA INTERRUPTIBLE (atiende comandos mientras espera)
+# ============================================================
+def dormir(t, conn):
+    """
+    Pausa por 't' segundos. Durante ese tiempo:
+      - Revisa el botón del jugador B (modo VS, turno B).
+      - Lee comandos TCP que lleguen del PC:
+          OFF     → interrumpe la visualización, apaga todo.
+          TURNO=X → actualiza el turno activo (sin interrumpir).
+          MODO=X  → actualiza el modo activo (sin interrumpir).
+    Retorna True si la visualización debe interrumpirse.
+
+    CORRECCIÓN: el dormir original solo manejaba OFF.
+    Esto causaba que comandos TURNO= llegados durante el display
+    fueran descartados silenciosamente.
+    """
+    global STOP, turno_actual, modo_actual
+
+    inicio     = time.ticks_ms()
+    duracion_ms = int(t * 1000)
+
+    while time.ticks_diff(time.ticks_ms(), inicio) < duracion_ms:
+
+        # ── Revisar botón del jugador B ──────────────────────
+        revisar_boton(conn)
+
+        # ── Atender comandos del PC ──────────────────────────
+        try:
+            conn.settimeout(0.001)   # no bloquear
+            data = conn.recv(1024)
+
+            if data:
+                msg = data.decode().strip().upper()
+
+                if msg == "OFF":
+                    # Detener visualización inmediatamente
+                    STOP = True
+                    apagar_todo()
+                    return True
+
+                elif msg.startswith("TURNO="):
+                    # Actualizar turno aunque estemos en medio del display
+                    # Esto permite que el jugador B empiece a usar el botón
+                    # mientras la palabra aún se muestra.
+                    turno_actual = msg.split("=")[1]
+                    print("Turno mid-display →", turno_actual)
+
+                elif msg.startswith("MODO="):
+                    # Actualizar modo aunque estemos en medio del display
+                    modo_actual = msg.split("=")[1]
+                    print("Modo mid-display →", modo_actual)
+
+                # Otros comandos se ignoran durante la visualización
+        except:
+            pass
+
+        time.sleep(0.01)
+
+    return False   # sin interrupción
+
+
+# ============================================================
+# MOSTRAR PALABRA LETRA A LETRA EN LEDs
+# ============================================================
+def mostrar_palabra_leds(texto, conn):
+    """
+    Enciende el LED de cada letra de 'texto' secuencialmente.
+    Cada letra aparece 1 segundo con 0.4 s de pausa entre letras.
+    La función es interruptible (comando OFF desde el PC).
+    """
+    global STOP
+    STOP = False
+
+    for letra in texto:
+        if STOP:
+            break
+
+        mostrar_letra(letra)             # encender LED de esta letra
+
+        if dormir(1.0, conn):            # mantener 1 segundo
+            return
+
+        apagar_todo()                    # apagar entre letras
+
+        if dormir(0.5, conn):            # pausa de 0.5f s
+            return
+
+
+# ============================================================
+# MOSTRAR PALABRA EN CÓDIGO MORSE (buzzer)
+# ============================================================
+def mostrar_palabra_morse(texto, conn):
+    """
+    Emite cada letra de 'texto' en código Morse por el buzzer.
+    Temporización según el estándar Morse:
+      - Punto  = 1 unidad  (TIEMPO_PUNTO)
+      - Raya   = 3 unidades (TIEMPO_RAYA)
+      - Silencio entre símbolos = 1 unidad
+      - Silencio entre letras   = 3 unidades
+    La función es interruptible (comando OFF desde el PC).
+    """
+    global STOP
+    STOP = False
+
+    for letra in texto:
+        if STOP:
+            break
+
+        if letra not in morse:
+            continue    # ignorar caracteres sin código Morse definido
+
+        for simbolo in morse[letra]:
+            if STOP:
+                break
+
+            buzzer.value(1)   # activar buzzer
+
+            if simbolo == ".":
+                if dormir(TIEMPO_PUNTO, conn):      # duración punto
+                    return
+            else:
+                if dormir(TIEMPO_RAYA, conn):       # duración raya
+                    return
+
+            buzzer.value(0)   # desactivar buzzer
+
+            # Silencio entre símbolos de la misma letra (1 unidad)
+            if dormir(TIEMPO_PUNTO, conn):
+                return
+
+        # Silencio entre letras (3 unidades)
+        if dormir(TIEMPO_PUNTO * 3, conn):
+            return
+
+    buzzer.value(0)   # asegurar que el buzzer quede apagado al final
+
+
+# ============================================================
+# REVISAR BOTÓN DEL JUGADOR B
+# ============================================================
+def revisar_boton(conn):
+    """
+    Detecta la presión y duración del botón físico del jugador B.
+    Solo actúa si:  modo_actual == "VS"  Y  turno_actual == "B"
+
+    Clasifica la presión y envía el símbolo al PC:
+      < 500 ms  → "." (punto)
+      < 1500 ms → "-" (raya)
+      >= 1500 ms→ "_" (separador de letra)
+
+    Incluye anti-rebote de 200 ms para evitar dobles lecturas.
+    """
+    global ultimo_boton
+
+    # Solo actuar en modo VS cuando es el turno de B
+    if modo_actual != "VS" or turno_actual != "B":
+        return
+
+    if boton.value() == 1:   # botón presionado
+        buzzer.value(1)
+        t_inicio = time.ticks_ms()
+
+        while boton.value() == 1:   # esperar que lo suelten
+            pass
+        
+        buzzer.value(0)
+        t_fin    = time.ticks_ms()
+        duracion = time.ticks_diff(t_fin, t_inicio)
+
+        # Anti-rebote: descartar si es muy seguido del anterior
+        ahora = time.ticks_ms()
+        if time.ticks_diff(ahora, ultimo_boton) < 200:
+            return
+        ultimo_boton = ahora
+
+        # Enviar símbolo al PC según duración
+        if duracion < 500:
+            conn.send(".".encode())    # punto
+            
+        elif duracion < 1500:
+            conn.send("-".encode())     # raya
+        else:
+            conn.send("_".encode())     # separador de letra
+
+
+# ============================================================
+# LOOP DEDICADO DE ESCUCHA PARA EL JUGADOR B (modo VS)
+# ============================================================
+def escuchar_boton_B(conn):
+    """
+    Loop post-display que espera el input del jugador B.
+    Se llama automáticamente después de mostrar la palabra en VS.
+
+    FLUJO:
+      1. PC muestra la palabra → display termina → entra aquí.
+      2. Jugador A teclea en el PC (la PC acumula su morse localmente).
+      3. Cuando A termina, el PC envía TURNO=B → turno_actual = "B".
+      4. Jugador B presiona el botón → revisar_boton() envía ".", "-", "_" al PC.
+      5. PC envía END_B o MODO=NORMAL → loop termina.
+
+    CORRECCIÓN: en el código original no existía este loop,
+    por lo que el jugador B no tenía forma de ingresar su morse
+    una vez que terminaba el display de la palabra.
+    """
+    global STOP, turno_actual, modo_actual
+
+    print("Escuchando input del jugador B...")
+    STOP = False
+
+    while not STOP:
+
+        # ── Revisar botón físico ──────────────────────────────
+        revisar_boton(conn)
+
+        # ── Atender comandos del PC ──────────────────────────
+        try:
+            conn.settimeout(0.001)
+            data = conn.recv(1024)
+
+            if data:
+                msg = data.decode().strip().upper()
+
+                if msg in ("OFF", "END_B"):
+                    # El PC indica fin del turno de B
+                    print("Fin del turno B")
+                    apagar_todo()
+                    STOP = True
+                    return
+
+                elif msg.startswith("TURNO="):
+                    # PC habilita el botón enviando TURNO=B
+                    turno_actual = msg.split("=")[1]
+                    print("Turno →", turno_actual)
+
+                elif msg.startswith("MODO="):
+                    modo_actual = msg.split("=")[1]
+                    if modo_actual == "NORMAL":
+                        # Volver al modo normal → salir del loop
+                        apagar_todo()
+                        STOP = True
+                        return
+
+        except:
+            pass
+
+        time.sleep(0.01)
+
+
+# ============================================================
+# MANEJAR MENSAJES RECIBIDOS DEL PC
+# ============================================================
+def manejar_mensaje(msg, conn):
+    """
+    Procesa los comandos que llegan desde la interfaz Python del PC.
+
+    Comandos reconocidos:
+      OFF        → detener todo inmediatamente
+      MODO=X     → cambiar modo de juego (NORMAL | VS)
+      TURNO=X    → cambiar turno activo (A | B)
+      FASE1/2/3  → ajustar velocidad del Morse
+      END_B      → terminar escucha del jugador B
+      (cualquier otro string) → mostrar como palabra (LEDs o Morse)
+    """
+    global modo_actual, turno_actual, STOP
+
+    msg = msg.strip().upper()
+    print("Mensaje:", msg)
+
+    # ── OFF: detener visualización ────────────────────────────
+    if msg == "OFF":
+        STOP = True
+        apagar_todo()
+        return
+
+    # ── MODO=X ───────────────────────────────────────────────
+    if msg.startswith("MODO="):
+        modo_actual = msg.split("=")[1]
+        print("Modo →", modo_actual)
+        return
+
+    # ── TURNO=X ──────────────────────────────────────────────
+    if msg.startswith("TURNO="):
+        turno_actual = msg.split("=")[1]
+        print("Turno →", turno_actual)
+        return
+
+    # ── FASE1 / FASE2 / FASE3 ────────────────────────────────
+    # Se envía como "FASE1", "FASE2" o "FASE3".
+    # Leemos el último carácter para obtener el número de fase.
+    if msg.startswith("FASE"):
+        try:
+            set_fase(int(msg[-1]))
+        except:
+            print("Fase inválida:", msg)
+        return
+
+    # ── END_B: terminar escucha de B ─────────────────────────
+    if msg == "END_B":
+        STOP = True
+        apagar_todo()
+        return
+
+    # ── PALABRA: mostrar en LEDs o Morse ─────────────────────
+    # El switch físico determina el modo de salida:
+    #   switch LOW  (0) → panel de LEDs
+    #   switch HIGH (1) → buzzer Morse
+    usar_morse = switch.value()
+
+    if usar_morse == 1:
+        mostrar_palabra_morse(msg, conn)
+    else:
+        mostrar_palabra_leds(msg, conn)
+
+    # En modo VS, después de mostrar la palabra, entrar en el
+    # loop de escucha dedicado para el botón del jugador B.
+    # (CORRECCIÓN: este bloque no existía en el código original)
+    if modo_actual == "VS" and not STOP:
+        escuchar_boton_B(conn)
+
+
+# ============================================================
+# SERVIDOR TCP (espera y atiende conexiones del PC)
+# ============================================================
+def start_server(ip):
+    """
+    Crea un servidor TCP en 'ip:PORT' y espera clientes.
+    Por cada cliente conectado, procesa mensajes en un loop.
+    Si el cliente se desconecta, espera al siguiente.
+    """
+    s = socket.socket()
+    s.bind((ip, PORT))
+    s.listen(1)
+    print(f"Servidor listo en {ip}:{PORT}")
+
+    while True:
+        print("Esperando cliente...")
+        conn, addr = s.accept()
+        print("Cliente conectado:", addr)
+
+        try:
+            while True:
+                # Esperar mensaje del PC (bloqueante hasta que llegue algo)
+                data = conn.recv(1024)
+                if not data:
+                    break   # cliente cerró la conexión
+
+                manejar_mensaje(data.decode(), conn)
+
+        except Exception as e:
+            print("Error o cliente desconectado:", e)
+
+        finally:
+            apagar_todo()
+            conn.close()
+            print("Conexión cerrada. Esperando reconexión...")
+
+
+# ============================================================
+# PUNTO DE ENTRADA
+# ============================================================
+apagar_todo()          # Asegurar estado limpio al arrancar
+ip = connect_wifi()    # Conectar a la red WiFi
+start_server(ip)       # Iniciar servidor y esperar al PC
